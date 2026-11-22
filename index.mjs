@@ -20,6 +20,12 @@ const ACCOUNT_ID = /&quot;awsAccountId&quot;:&quot;([^&]+)&quot;|"awsAccountId"\
 const QUOTA = /agent\s*hours?|entitlement|quota|usage\s*limit|insufficient.*(minutes|hours)|(minutes|hours).*(exhausted|exceeded)/i;
 const EXPIRED = "The Quick session has expired. Sign in to Quick again and re-add the cookie.";
 const PAGE_TTL = 5 * 60 * 1000;
+// Quick refuses a userMessage past 50,000 characters
+// (CHAT_MESSAGE_LENGTH_EXCEEDED), so a long conversation is sent as its most
+// recent turns rather than whole.
+const MESSAGE_LIMIT = 50_000;
+const OMITTED = "[... earlier messages omitted ...]";
+const CUT = "\n[... truncated ...]";
 
 const MODES = {
   auto: { name: "Auto", mode: undefined, reasoning: false },
@@ -131,19 +137,59 @@ function textOf(content) {
     .join("\n");
 }
 
-// promptOf is the chat transcript Quick receives as its userMessage.
-function promptOf(messages) {
-  const said = [];
+// linesOf is each message as the transcript line Quick receives. System and
+// developer instructions are kept apart so trimming never drops them.
+function linesOf(messages) {
+  const instructions = [];
+  const turns = [];
   for (const message of messages) {
     const text = textOf(message?.content);
     if (!text) continue;
-    if (message.role === "system" || message.role === "developer") said.push(`System instructions:\n${text}`);
-    else if (message.role === "assistant") said.push(`Assistant: ${text}`);
-    else if (message.role === "tool") said.push(`Tool result: ${text}`);
-    else said.push(`User: ${text}`);
+    if (message.role === "system" || message.role === "developer") instructions.push(`System instructions:\n${text}`);
+    else if (message.role === "assistant") turns.push(`Assistant: ${text}`);
+    else if (message.role === "tool") turns.push(`Tool result: ${text}`);
+    else turns.push(`User: ${text}`);
   }
-  if (said.length === 1 && said[0].startsWith("User: ")) return said[0].slice(6);
-  return said.join("\n\n");
+  return { instructions, turns };
+}
+
+// clip keeps both ends of a text that doesn't fit, since an instruction often
+// opens with the ask and closes with the detail.
+function clip(text, budget) {
+  if (budget <= 0) return "";
+  if (text.length <= budget) return text;
+  if (budget <= CUT.length) return text.slice(0, budget);
+  const room = budget - CUT.length;
+  const head = Math.ceil(room * 0.4);
+  return text.slice(0, head) + CUT + text.slice(text.length - (room - head));
+}
+
+// promptOf is the chat transcript Quick receives as its userMessage, cut to
+// what Quick accepts. Instructions are kept whole where they fit, the newest
+// turn is what the model is answering, and older turns fall away from the
+// oldest end first.
+function promptOf(messages) {
+  const { instructions, turns } = linesOf(messages);
+  if (turns.length === 1 && instructions.length === 0 && turns[0].startsWith("User: ")) {
+    return clip(turns[0].slice(6), MESSAGE_LIMIT);
+  }
+  if (!turns.length) return clip(instructions.join("\n\n"), MESSAGE_LIMIT);
+
+  const fixed = clip(instructions.join("\n\n"), Math.floor(MESSAGE_LIMIT * 0.3));
+  const prefix = fixed ? `${fixed}\n\n` : "";
+  const room = MESSAGE_LIMIT - prefix.length - OMITTED.length - 2;
+
+  const newest = turns.at(-1);
+  const kept = [clip(newest, Math.max(room, 0))];
+  let used = kept[0].length;
+  for (let i = turns.length - 2; i >= 0; i--) {
+    const cost = turns[i].length + 2;
+    if (used + cost > room) break;
+    kept.unshift(turns[i]);
+    used += cost;
+  }
+  const body = kept.length < turns.length ? [OMITTED, ...kept].join("\n\n") : kept.join("\n\n");
+  return (prefix + body).slice(0, MESSAGE_LIMIT);
 }
 
 function openAIBody(model, text, created) {

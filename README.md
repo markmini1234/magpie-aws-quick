@@ -68,6 +68,16 @@ git clone https://github.com/markmini1234/magpie-aws-quick.git
 
 Quick 的 Cookie 过期后，插件返回 401 并标记账号需要重新登录。重新登录一次即可。
 
+## 50000 字符上限
+
+Quick 的 `userMessage` 上限是 **50000 字符**，超了会返回：
+
+```
+CHAT_MESSAGE_LENGTH_EXCEEDED: Request exceeded chat message limit of 50000 characters
+```
+
+插件会把对话裁到这个预算内：系统提示优先保留，最新一轮完整保留，旧消息从最早的一条开始丢弃，并在开头标注 `[... earlier messages omitted ...]`。单条超长消息会保留首尾并标注 `[... truncated ...]`。
+
 ## 10 小时用量
 
 Quick 免费试用版给的是 **600 分钟（10 小时）agent hours**。插件会读取 Quick 的 metering 接口，在 Magpie 的账号卡片上显示剩余时长，例如：
