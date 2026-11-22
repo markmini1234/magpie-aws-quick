@@ -54,8 +54,11 @@ function cookiePairs(text) {
     /(?:^|\s)(?:-H\s+|--header\s+)?['"]cookie:\s*([^'"]+)['"]/im.exec(text)?.[1] ??
     /^\s*cookie:\s*(.+)$/im.exec(text)?.[1] ??
     text;
+  // A cookie copied out of a terminal or a wrapped text box arrives with
+  // newlines inside long values; no cookie value means anything by them.
+  const flat = header.replace(/\s*\n\s*/g, "");
   const out = new Map();
-  for (const part of header.split(";")) {
+  for (const part of flat.split(";")) {
     const at = part.indexOf("=");
     if (at <= 0) continue;
     const name = part.slice(0, at).trim();
@@ -131,11 +134,28 @@ function regionOf(cookie, given) {
 // hands the typed values inward.
 function sessionFrom(cookie, askedAccount, askedRegion) {
   const creds = credentialsOf(cookie);
-  if (!creds) return { error: "The Quick sign-in has no aws-creds value." };
+  if (!creds) {
+    const names = [...cookie.keys()];
+    if (!cookie.has("aws-creds")) {
+      if (cookie.has("aws-ds-access-token") || cookie.has("aws-directoryUserInfo")) {
+        return {
+          error: `This is a Quick single sign-on (AWS Identity Center) session, not an AWS credential. It has aws-ds-access-token and aws-directoryUserInfo but no aws-creds, so it cannot sign the QuickSight API. Open the Quick console once (so *.quicksight.aws.amazon.com loads), then copy the Cookie header of a request to *.quicksight.aws.amazon.com — that one carries aws-creds.`,
+        };
+      }
+      return {
+        error: `No aws-creds cookie in what was pasted (found: ${names.join(", ") || "nothing"}). Copy the Cookie header of a request to quick.aws.com or *.quicksight.aws.amazon.com after signing in, not a request to another site.`,
+      };
+    }
+    return {
+      error: `aws-creds is present but holds no readable accessKeyId/secretAccessKey. It may be an encrypted or truncated value; copy the cookie again in full, straight from the request headers.`,
+    };
+  }
   const given = typeof askedAccount === "string" ? askedAccount.trim() : "";
   const accountId = given || accountOf(cookie);
   if (!ACCOUNT.test(accountId)) {
-    return { error: "AWS account id must be 12 digits. It can be read from aws-consoleInfo, or typed here." };
+    return {
+      error: `AWS account id must be 12 digits, and aws-consoleInfo did not give one (found: ${[...cookie.keys()].join(", ") || "nothing"}). Type it in the account id field.`,
+    };
   }
   return { creds, accountId, region: regionOf(cookie, askedRegion), expires: expirationOf(cookie) };
 }

@@ -119,7 +119,14 @@ async function cookiesOf(port, signal) {
   try {
     const send = rpc(ws);
     await send("Network.enable");
-    const found = await send("Network.getCookies", { urls: ["https://quick.aws.com/", "https://quick.aws.com/sn"] });
+    const found = await send("Network.getCookies", {
+      urls: [
+        "https://quick.aws.com/",
+        "https://quick.aws.com/sn",
+        "https://us-east-1.quicksight.aws.amazon.com/",
+        "https://us-east-1.quicksight.aws.amazon.com/sn",
+      ],
+    });
     return new Map((found.cookies ?? []).map((cookie) => [cookie.name, cookie.value]));
   } finally {
     ws.close();
@@ -172,7 +179,15 @@ export async function quickSession(signal) {
       }
       const raw = cookies.get("aws-creds");
       if (raw) return { cookies, raw };
-      if (Date.now() > deadline) throw new Error("Timed out waiting for the Quick sign-in");
+      if (Date.now() > deadline) {
+        const seen = [...cookies.keys()];
+        const sso = cookies.has("aws-ds-access-token") || cookies.has("aws-directoryUserInfo");
+        throw new Error(
+          sso
+            ? "Quick signed in through single sign-on, but no aws-creds cookie appeared. Open the Quick console once so quicksight.aws.amazon.com loads, then sign in again."
+            : `Timed out waiting for the Quick sign-in (cookies seen: ${seen.join(", ") || "none"}).`,
+        );
+      }
       await sleep(POLL_MS);
     }
   } finally {
