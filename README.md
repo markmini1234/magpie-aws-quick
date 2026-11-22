@@ -58,9 +58,11 @@ git clone https://github.com/markmini1234/magpie-aws-quick.git
 1. 登录 `https://quick.aws.com/sn`。
 2. 开发者工具 → Network，点任意一个发往 `quick.aws.com` 的请求。
 3. 复制请求头里的 `Cookie`（或整段 cURL）。
-4. Account alias 留空即可，插件会从 `qs-directory-alias` / `qs-saved-accounts` 读取。
+4. Account alias 留空即可：插件会用这个 Cookie 请求 `/sn/start`，让 Quick 自己告诉它账号。
 
-关键字段是 `JSESSIONID`。`aws-ds-access-token`、`aws-directoryUserInfo` 这些是 SSO 相关，插件不依赖它们。
+关键字段是 `JSESSIONID`。`qs-directory-alias`、`qs-saved-accounts` 这些不是必须的——它们只在账号页面加载后才出现，从早期请求复制的 Cookie 往往没有，插件不再依赖它们。
+
+登出/过期时会直接报“会话已过期”，不会再把登录页当成模型回复。
 
 ## 会话过期
 

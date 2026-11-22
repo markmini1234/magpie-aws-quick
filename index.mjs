@@ -14,8 +14,8 @@ import { decodeEventStream, eventTypeOf, frameMessage } from "./src/eventstream.
 
 const ID = "quick";
 const ORIGIN = "https://quick.aws.com";
-const ACCOUNT = /^\d{12}$/;
 const CSRF = /&quot;csrf&quot;:&quot;([^&]+)&quot;|"csrf"\s*:\s*"([^"]+)"/;
+const EXPIRED = "The Quick session has expired. Sign in to Quick again and re-add the cookie.";
 
 const MODES = {
   auto: { name: "Auto", mode: undefined, reasoning: false },
@@ -58,53 +58,41 @@ function cookiePairs(text) {
   return out;
 }
 
-function jsonCookie(cookie, name) {
-  const raw = cookie.get(name);
-  if (!raw) return undefined;
-  for (const text of [raw, (() => {
-    try {
-      return decodeURIComponent(raw);
-    } catch {
-      return "";
-    }
-  })()]) {
-    try {
-      return JSON.parse(text);
-    } catch {
-      // try the next shape
-    }
-  }
-  return undefined;
-}
-
-// aliasOf is the Quick account alias the proxy path is keyed by. It is the
-// AWS account id for a standalone account, and a different name for an
-// organization's.
-function aliasOf(cookie, asked) {
-  const given = typeof asked === "string" ? asked.trim() : "";
-  if (given) return given;
-  const saved = jsonCookie(cookie, "qs-saved-accounts");
-  const first = Array.isArray(saved?.a) ? saved.a[0] : undefined;
-  const alias = cookie.get("qs-directory-alias") ?? first?.an ?? first?.id;
-  if (typeof alias === "string" && alias.trim()) return alias.trim();
-  const directory = jsonCookie(cookie, "aws-directoryUserInfo");
-  if (typeof directory?.alias === "string" && directory.alias.trim()) return directory.alias.trim();
-  return "";
+// aliasFromServer asks Quick which account the session is for. A signed-in
+// session is redirected from /sn/start to /sn/account/<alias>/start; a
+// signed-out one to /sn.
+async function aliasFromServer(cookieHeader, signal) {
+  const response = await fetch(`${ORIGIN}/sn/start`, {
+    headers: { cookie: cookieHeader, accept: "text/html" },
+    redirect: "manual",
+    signal,
+  });
+  if (response.status !== 302) return { error: `Quick answered HTTP ${response.status} instead of redirecting to an account` };
+  const location = response.headers.get("location") ?? "";
+  const found = /\/sn\/account\/([^/?#]+)\//.exec(location);
+  if (found) return { alias: decodeURIComponent(found[1]) };
+  return { expired: true };
 }
 
 // sessionFrom is the sign-in boundary: it reads the pasted Cookie once and
 // hands typed values inward.
-function sessionFrom(cookie, askedAlias) {
+async function sessionFrom(cookie, askedAlias, signal) {
   if (!cookie.has("JSESSIONID")) {
     return {
       error: `No JSESSIONID in what was pasted (found: ${[...cookie.keys()].join(", ") || "nothing"}). Copy the Cookie header of a request to quick.aws.com while signed in.`,
     };
   }
-  const alias = aliasOf(cookie, askedAlias);
-  if (!alias) {
-    return { error: "Could not read the Quick account alias. Paste qs-directory-alias too, or type the account id." };
-  }
-  return { alias, cookie: [...cookie].map(([name, value]) => `${name}=${value}`).join("; ") };
+  const header = [...cookie].map(([name, value]) => `${name}=${value}`).join("; ");
+  const given = typeof askedAlias === "string" ? askedAlias.trim() : "";
+  // The server is the word on whether the session is signed in, and which
+  // account it belongs to. The cookie alone is not: a signed-out page also
+  // carries a JSESSIONID, and the alias cookies appear only after the
+  // account page loads.
+  const asked = await aliasFromServer(header, signal);
+  if (asked.alias) return { alias: given || asked.alias, cookie: header };
+  if (asked.expired) return { error: EXPIRED, expired: true };
+  if (given) return { alias: given, cookie: header };
+  return { error: asked.error };
 }
 
 // csrfOf reads the token the page hands the app. It is also in the mbtc
@@ -203,6 +191,7 @@ async function quickChat(session, body, signal) {
       referer: `${ORIGIN}/sn/account/${encodeURIComponent(session.alias)}/start/chat`,
     },
     body: JSON.stringify(payload),
+    redirect: "manual",
     signal,
   });
   return { model, response };
@@ -214,11 +203,11 @@ const errorResponse = (status, message, signIn) =>
     headers: { "content-type": "application/json", ...(signIn ? { "X-Magpie-Sign-In": signIn } : {}) },
   });
 
-const EXPIRED = "The Quick session has expired. Sign in to Quick again and re-add the cookie.";
-
 async function failure(response) {
+  // A signed-out session is answered with the login page, not the API.
+  if (response.status === 301 || response.status === 302) return errorResponse(401, EXPIRED, "expired");
   const text = (await response.text()).trim().slice(0, 800);
-  if (response.status === 401 || response.status === 302) return errorResponse(401, EXPIRED, "expired");
+  if (response.status === 401) return errorResponse(401, EXPIRED, "expired");
   return errorResponse(response.status, text || `Quick answered HTTP ${response.status}`);
 }
 
@@ -310,7 +299,7 @@ export async function QuickPlugin(_input, _options = {}) {
           prompts: [
             {
               key: "accountId",
-              message: "Quick account alias (blank reads it from the browser session)",
+              message: "Quick account alias (blank asks Quick)",
               required: false,
               validate: (value) => (typeof value === "string" && value.trim() && /\s/.test(value.trim()) ? "An account alias has no spaces" : undefined),
             },
@@ -322,13 +311,13 @@ export async function QuickPlugin(_input, _options = {}) {
               opened: true,
               callback: async (_code, options = {}) => {
                 const { header } = await quickSession(options.signal ?? signal);
-                const session = sessionFrom(cookiePairs(header), inputs.accountId);
+                const session = await sessionFrom(cookiePairs(header), inputs.accountId, options.signal ?? signal);
                 if (session.error) return { type: "failed", error: session.error };
                 return {
                   type: "success",
                   access: session.cookie,
                   refresh: "",
-                  expires: Date.now() + 7 * 24 * 60 * 60 * 1000,
+                  expires: 0,
                   metadata: { alias: session.alias },
                 };
               },
@@ -347,12 +336,12 @@ export async function QuickPlugin(_input, _options = {}) {
             },
             {
               key: "accountId",
-              message: "Quick account alias (blank reads it from the cookie)",
+              message: "Quick account alias (blank asks Quick)",
               required: false,
             },
           ],
-          authorize(inputs) {
-            const session = sessionFrom(cookiePairs(typeof inputs.cookie === "string" ? inputs.cookie : ""), inputs.accountId);
+          async authorize(inputs) {
+            const session = await sessionFrom(cookiePairs(typeof inputs.cookie === "string" ? inputs.cookie : ""), inputs.accountId);
             if (session.error) return { type: "failed", error: session.error };
             return {
               type: "success",

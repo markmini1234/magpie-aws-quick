@@ -138,6 +138,20 @@ async function stop(proc) {
   if (proc.exitCode === null) proc.kill("SIGKILL");
 }
 
+// signedInAs is the account alias a Quick session belongs to, or "" while the
+// session is still signed out. /sn/start answers a signed-in session with a
+// redirect to /sn/account/<alias>/start; a signed-out one goes to /sn.
+async function signedInAs(header, signal) {
+  const response = await fetch("https://quick.aws.com/sn/start", {
+    headers: { cookie: header, accept: "text/html" },
+    redirect: "manual",
+    signal,
+  });
+  if (response.status !== 302) return "";
+  const found = /\/sn\/account\/([^/?#]+)\//.exec(response.headers.get("location") ?? "");
+  return found ? decodeURIComponent(found[1]) : "";
+}
+
 // quickSession waits for a signed-in Quick tab and gives its Cookie header.
 export async function quickSession(signal) {
   const binary = browserPath();
@@ -175,11 +189,13 @@ export async function quickSession(signal) {
       } catch {
         // Chrome may still be creating its first page.
       }
-      // The Quick web session is the JSESSIONID pair plus the account alias;
-      // a signed-in tab has both.
-      if (cookies.has("JSESSIONID") && cookies.has("qs-directory-alias")) {
+      // JSESSIONID alone is not a sign-in: the signed-out page carries one
+      // too. The alias cookies only appear once an account page has loaded,
+      // so ask Quick which account the session is for instead.
+      if (cookies.has("JSESSIONID")) {
         const header = [...cookies].map(([name, value]) => `${name}=${value}`).join("; ");
-        return { cookies, header };
+        const alias = await signedInAs(header, signal);
+        if (alias) return { cookies, header, alias };
       }
       if (Date.now() > deadline) {
         const seen = [...cookies.keys()];
