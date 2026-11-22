@@ -76,7 +76,11 @@ Quick 的 `userMessage` 上限是 **50000 字符**，超了会返回：
 CHAT_MESSAGE_LENGTH_EXCEEDED: Request exceeded chat message limit of 50000 characters
 ```
 
-插件会把对话裁到这个预算内：系统提示优先保留，最新一轮完整保留，旧消息从最早的一条开始丢弃，并在开头标注 `[... earlier messages omitted ...]`。单条超长消息会保留首尾并标注 `[... truncated ...]`。
+插件会先尽量**续接同一个 Quick 会话**：Magpie 每次都会把完整对话发过来，插件用“上次发给 Quick 的对话”做前缀匹配，命中就只发这一轮的新消息，历史由 Quick 保存在服务端——和 Quick 网页端的行为一致，长对话因此不再撞 5 万字符上限。
+
+只有开新会话（首轮、改了系统提示、重新生成）时才会整段发送，这时才按预算裁剪：系统提示优先保留，最新一轮完整保留，旧消息从最早的一条开始丢弃，并在开头标注 `[... earlier messages omitted ...]`。单条超长消息会保留首尾并标注 `[... truncated ...]`。
+
+重新生成（对话内容没变再发一次）会开一个新 Quick 会话，避免同一条消息在旧会话里重复追加。
 
 ## 10 小时用量
 

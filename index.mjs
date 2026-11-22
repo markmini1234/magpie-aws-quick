@@ -8,7 +8,7 @@
 // with the browser's Quick session Cookie and the page's CSRF token (mbtc).
 // The reply is an AWS event stream whose events are JSON. So the sign-in is
 // the Quick session itself, not AWS SigV4 credentials.
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { QUICK_LOGIN, quickSession } from "./src/browser.mjs";
 import { decodeEventStream, eventTypeOf, frameMessage } from "./src/eventstream.mjs";
 
@@ -215,10 +215,15 @@ function chunkOf(id, model, created, delta, finish = null) {
 
 const sse = (event) => `data: ${JSON.stringify(event)}\n\n`;
 
-async function quickChat(session, page, body, signal) {
+// quickChat sends one turn. A turn that continues an earlier Quick
+// conversation carries only the new message: Quick keeps the history, so the
+// 50,000-character limit applies to this turn alone, as it does to Quick's
+// own web client. Anything else is sent as the whole (clipped) transcript.
+async function quickChat(session, page, body, signal, continued) {
   const model = String(body.model ?? "auto").replace(`${ID}/`, "");
   const mode = MODES[model]?.mode;
-  const userMessage = promptOf(Array.isArray(body.messages) ? body.messages : []);
+  const turns = Array.isArray(body.messages) ? body.messages : [];
+  const userMessage = continued ? textOf(turns.at(-1)?.content) : promptOf(turns);
   if (!userMessage) return { error: "Quick needs at least one non-empty text message" };
 
   const found = page;
@@ -230,7 +235,8 @@ async function quickChat(session, page, body, signal) {
     userMessage,
     clientToken: randomUUID(),
     inferenceOnly: true,
-    temporaryChat: true,
+    temporaryChat: !continued,
+    ...(continued ? { conversationId: continued } : {}),
     ...(mode ? { performanceMode: mode } : {}),
   };
   const response = await fetch(url, {
@@ -270,21 +276,26 @@ async function failure(response) {
   return errorResponse(response.status, text || `Quick answered HTTP ${response.status}`);
 }
 
-// answer turns Quick's event stream into an OpenAI completion.
-async function answer(response, model, stream) {
+// answer turns Quick's event stream into an OpenAI completion. happened is
+// told the conversation Quick answered in and the reply, so the next turn can
+// be recognised as a continuation of it.
+async function answer(response, model, stream, happened = () => {}) {
   if (!response.ok) return failure(response);
   const created = Math.floor(Date.now() / 1000);
   const id = `chatcmpl-quick-${randomUUID()}`;
   const encoder = new TextEncoder();
+  let conversation = "";
 
   if (!stream) {
     let text = "";
     for await (const frame of decodeEventStream(response.body)) {
       const type = eventTypeOf(frame);
+      if (frame.payload?.conversationId) conversation = String(frame.payload.conversationId);
       if (type === "textMessageEvent") text += String(frame.payload?.textMessage ?? "");
       else if (type === "metadataEvent" && !text) text = String(frame.payload?.finalTextMessage ?? "");
       else if (type === "internalFailureException" || type === "invalidRequestException") throw new Error(frameMessage(frame));
     }
+    happened(conversation, text);
     return new Response(JSON.stringify(openAIBody(model, text, created)), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -294,23 +305,28 @@ async function answer(response, model, stream) {
   const body = new ReadableStream({
     async start(controller) {
       let sent = false;
+      let text = "";
       controller.enqueue(encoder.encode(sse(chunkOf(id, model, created, { role: "assistant", content: "" }))));
       for await (const frame of decodeEventStream(response.body)) {
         const type = eventTypeOf(frame);
+        if (frame.payload?.conversationId) conversation = String(frame.payload.conversationId);
         if (type === "textMessageEvent") {
-          const text = String(frame.payload?.textMessage ?? "");
-          if (text) {
+          const part = String(frame.payload?.textMessage ?? "");
+          if (part) {
             sent = true;
-            controller.enqueue(encoder.encode(sse(chunkOf(id, model, created, { content: text }))));
+            text += part;
+            controller.enqueue(encoder.encode(sse(chunkOf(id, model, created, { content: part }))));
           }
         } else if (type === "metadataEvent" && frame.payload?.finalTextMessage && !sent) {
           // A reply that only carries the final text still arrives whole.
           sent = true;
-          controller.enqueue(encoder.encode(sse(chunkOf(id, model, created, { content: String(frame.payload.finalTextMessage) }))));
+          text = String(frame.payload.finalTextMessage);
+          controller.enqueue(encoder.encode(sse(chunkOf(id, model, created, { content: text }))));
         } else if (type === "internalFailureException" || type === "invalidRequestException") {
           throw new Error(frameMessage(frame));
         }
       }
+      happened(conversation, text);
       controller.enqueue(encoder.encode(sse(chunkOf(id, model, created, {}, "stop"))));
       controller.enqueue(encoder.encode("data: [DONE]\n\n"));
       controller.close();
@@ -428,6 +444,21 @@ export async function QuickPlugin(_input, _options = {}) {
           readAt = Date.now();
           return page;
         };
+        // Magpie hands the plugin the whole transcript on every request, so a
+        // Quick conversation is continued only when the transcript it was
+        // last given is exactly this request's prefix. A changed system
+        // prompt, a regenerated answer or a fork starts a new conversation.
+        const continuations = new Map();
+        // Transcripts already answered. One sent again unchanged is a
+        // regenerate: continuing would append its last turn twice.
+        const answered = new Map();
+        const CONTINUATIONS_MAX = 256;
+        const fingerprint = (messages) => createHash("sha256").update(JSON.stringify(messages)).digest("hex").slice(0, 32);
+        const remember = (map, key, value) => {
+          map.delete(key);
+          map.set(key, value);
+          if (map.size > CONTINUATIONS_MAX) map.delete(map.keys().next().value);
+        };
         return {
           baseURL: ORIGIN,
           fetch: async (input, init = {}) => {
@@ -448,22 +479,40 @@ export async function QuickPlugin(_input, _options = {}) {
                 headers: { "content-type": "application/json" },
               });
             }
+            const turns = Array.isArray(body.messages) ? body.messages : [];
+            const prefix = turns.slice(0, -1);
+            const prefixKey = prefix.length ? fingerprint(prefix) : "";
+            const regenerating = !!answered.get(fingerprint(turns));
+            const continuing = !regenerating && turns.at(-1)?.role === "user" && prefixKey ? continuations.get(prefixKey)?.id : undefined;
             const signal = init.signal ?? request?.signal;
             let current = await pageNow(signal);
             if (current.expired) return errorResponse(401, EXPIRED, "expired");
             if (current.error) return errorResponse(502, current.error);
-            let result = await quickChat(session, current, body, signal);
+            let result = await quickChat(session, current, body, signal, continuing);
             // A CSRF token can be spent by a page the user reloaded; read the
             // page once more and retry that request.
             if (result.response?.status === 401) {
               page = undefined;
               current = await pageNow(signal);
               if (current.expired) return errorResponse(401, EXPIRED, "expired");
-              result = await quickChat(session, current, body, signal);
+              result = await quickChat(session, current, body, signal, continuing);
+            } else if (continuing && result.response?.status === 400) {
+              // The conversation is gone (deleted, or an older one Quick no
+              // longer holds): ask again with the whole transcript.
+              continuations.delete(prefixKey);
+              result = await quickChat(session, current, body, signal, undefined);
             }
             if (result.expired) return errorResponse(401, EXPIRED, "expired");
             if (result.error) return errorResponse(400, result.error);
-            return answer(result.response, result.model, body.stream === true);
+            return answer(result.response, result.model, body.stream === true, (conversation, reply) => {
+              if (!conversation) return;
+              remember(continuations, fingerprint(turns), { id: conversation, at: Date.now() });
+              // What a client sends next adds our reply before its new turn,
+              // so that transcript is the one to recognise too.
+              remember(continuations, fingerprint([...turns, { role: "assistant", content: reply }]), { id: conversation, at: Date.now() });
+              remember(answered, fingerprint(turns), true);
+              remember(answered, fingerprint([...turns, { role: "assistant", content: reply }]), true);
+            });
           },
         };
       },
