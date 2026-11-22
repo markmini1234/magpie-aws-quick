@@ -1,6 +1,6 @@
 {
   "name": "magpie-quick-auth",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "description": "AWS Quick chat models inside Magpie, through the Quick web console's own conversation API",
   "type": "module",

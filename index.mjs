@@ -15,7 +15,11 @@ import { decodeEventStream, eventTypeOf, frameMessage } from "./src/eventstream.
 const ID = "quick";
 const ORIGIN = "https://quick.aws.com";
 const CSRF = /&quot;csrf&quot;:&quot;([^&]+)&quot;|"csrf"\s*:\s*"([^"]+)"/;
+const USER_ID = /&quot;quickSightUserId&quot;:&quot;([^&]+)&quot;|"quickSightUserId"\s*:\s*"([^"]+)"/;
+const ACCOUNT_ID = /&quot;awsAccountId&quot;:&quot;([^&]+)&quot;|"awsAccountId"\s*:\s*"([^"]+)"/;
+const QUOTA = /agent\s*hours?|entitlement|quota|usage\s*limit|insufficient.*(minutes|hours)|(minutes|hours).*(exhausted|exceeded)/i;
 const EXPIRED = "The Quick session has expired. Sign in to Quick again and re-add the cookie.";
+const PAGE_TTL = 5 * 60 * 1000;
 
 const MODES = {
   auto: { name: "Auto", mode: undefined, reasoning: false },
@@ -95,9 +99,9 @@ async function sessionFrom(cookie, askedAlias, signal) {
   return { error: asked.error };
 }
 
-// csrfOf reads the token the page hands the app. It is also in the mbtc
-// query parameter of every call the page makes.
-async function csrfOf(session, signal) {
+// pageOf reads what the Quick page hands the app: the CSRF token every call
+// carries, and the user's ARN the metering API asks for.
+async function pageOf(session, signal) {
   const response = await fetch(`${ORIGIN}/sn/account/${encodeURIComponent(session.alias)}/start/chat`, {
     headers: { cookie: session.cookie, accept: "text/html" },
     redirect: "manual",
@@ -106,10 +110,15 @@ async function csrfOf(session, signal) {
   // A signed-out session is answered with a redirect to /sn, not a page.
   if (response.status !== 200) return { expired: true };
   const page = await response.text();
-  const found = CSRF.exec(page);
-  const token = found?.[1] ?? found?.[2];
+  const token = CSRF.exec(page)?.[1] ?? CSRF.exec(page)?.[2];
   if (!token) return { error: "The Quick page carried no CSRF token" };
-  return { csrf: decodeURIComponent(token) };
+  const user = USER_ID.exec(page);
+  const account = ACCOUNT_ID.exec(page);
+  return {
+    csrf: decodeURIComponent(token),
+    userId: decodeURIComponent(user?.[1] ?? user?.[2] ?? ""),
+    accountId: (account?.[1] ?? account?.[2] ?? "") || session.alias,
+  };
 }
 
 // textOf is one OpenAI content value as plain text.
@@ -160,17 +169,15 @@ function chunkOf(id, model, created, delta, finish = null) {
 
 const sse = (event) => `data: ${JSON.stringify(event)}\n\n`;
 
-async function quickChat(session, body, signal) {
+async function quickChat(session, page, body, signal) {
   const model = String(body.model ?? "auto").replace(`${ID}/`, "");
   const mode = MODES[model]?.mode;
   const userMessage = promptOf(Array.isArray(body.messages) ? body.messages : []);
   if (!userMessage) return { error: "Quick needs at least one non-empty text message" };
 
-  const found = await csrfOf(session, signal);
-  if (found.expired) return { expired: true };
-  if (found.error) return { error: found.error };
+  const found = page;
   const url = new URL(
-    `${ORIGIN}/sn/account/${encodeURIComponent(session.alias)}/qbsproxy/quicksight/accounts/${encodeURIComponent(session.alias)}/conversations/chat`,
+    `${ORIGIN}/sn/account/${encodeURIComponent(session.alias)}/qbsproxy/quicksight/accounts/${encodeURIComponent(found.accountId)}/conversations/chat`,
   );
   url.searchParams.set("mbtc", found.csrf);
   const payload = {
@@ -197,10 +204,10 @@ async function quickChat(session, body, signal) {
   return { model, response };
 }
 
-const errorResponse = (status, message, signIn) =>
+const errorResponse = (status, message, signIn, headers = {}) =>
   new Response(JSON.stringify({ error: { type: status === 401 ? "authentication_error" : "api_error", message } }), {
     status,
-    headers: { "content-type": "application/json", ...(signIn ? { "X-Magpie-Sign-In": signIn } : {}) },
+    headers: { "content-type": "application/json", ...(signIn ? { "X-Magpie-Sign-In": signIn } : {}), ...headers },
   });
 
 async function failure(response) {
@@ -208,6 +215,12 @@ async function failure(response) {
   if (response.status === 301 || response.status === 302) return errorResponse(401, EXPIRED, "expired");
   const text = (await response.text()).trim().slice(0, 800);
   if (response.status === 401) return errorResponse(401, EXPIRED, "expired");
+  // Quick's free trial counts agent hours, and a spent allowance comes back
+  // as a request error. 429 sends the request to the group's other providers
+  // and rests this account, as a spent allowance should.
+  if ((response.status === 400 || response.status === 402 || response.status === 429) && QUOTA.test(text)) {
+    return errorResponse(429, text, "", { "retry-after": "600" });
+  }
   return errorResponse(response.status, text || `Quick answered HTTP ${response.status}`);
 }
 
@@ -359,6 +372,16 @@ export async function QuickPlugin(_input, _options = {}) {
         if (typeof cookie !== "string" || !cookie) throw new Error("Quick sign-in has no session cookie");
         if (typeof alias !== "string" || !alias) throw new Error("Quick sign-in has no account alias");
         const session = { cookie, alias };
+        // The page's CSRF token and user ARN are read once and kept for a few
+        // minutes. A request that finds the session gone reads it again.
+        let page;
+        let readAt = 0;
+        const pageNow = async (signal) => {
+          if (page && Date.now() - readAt < PAGE_TTL) return page;
+          page = await pageOf(session, signal);
+          readAt = Date.now();
+          return page;
+        };
         return {
           baseURL: ORIGIN,
           fetch: async (input, init = {}) => {
@@ -379,11 +402,71 @@ export async function QuickPlugin(_input, _options = {}) {
                 headers: { "content-type": "application/json" },
               });
             }
-            const result = await quickChat(session, body, init.signal ?? request?.signal);
+            const signal = init.signal ?? request?.signal;
+            let current = await pageNow(signal);
+            if (current.expired) return errorResponse(401, EXPIRED, "expired");
+            if (current.error) return errorResponse(502, current.error);
+            let result = await quickChat(session, current, body, signal);
+            // A CSRF token can be spent by a page the user reloaded; read the
+            // page once more and retry that request.
+            if (result.response?.status === 401) {
+              page = undefined;
+              current = await pageNow(signal);
+              if (current.expired) return errorResponse(401, EXPIRED, "expired");
+              result = await quickChat(session, current, body, signal);
+            }
             if (result.expired) return errorResponse(401, EXPIRED, "expired");
             if (result.error) return errorResponse(400, result.error);
             return answer(result.response, result.model, body.stream === true);
           },
+        };
+      },
+
+      // usage is Quick's own agent-hours allowance: the free trial provisions
+      // 600 minutes (10 hours), shown beside the account as a share.
+      async usage(getAuth, _provider, options = {}) {
+        const auth = await getAuth();
+        const cookie = auth?.type === "oauth" ? auth.access : auth?.key;
+        const alias = auth?.metadata?.alias;
+        if (typeof cookie !== "string" || !cookie || typeof alias !== "string" || !alias) {
+          return { error: "Quick sign-in is incomplete" };
+        }
+        const session = { cookie, alias };
+        const page = await pageOf(session, options.signal);
+        if (page.expired) return { error: EXPIRED, signIn: "expired" };
+        if (page.error) return { error: page.error };
+        if (!page.userId) return { error: "Quick did not name the signed-in user" };
+        const url = new URL(
+          `${ORIGIN}/sn/account/${encodeURIComponent(alias)}/qbsproxy/quicksight/agenticmetering/v1/get-available-entitlement-units`,
+        );
+        url.searchParams.set("unitType", "AUTOMATION_AGENT_HOUR_UNIT");
+        url.searchParams.set("userArn", page.userId);
+        url.searchParams.set("mbtc", page.csrf);
+        const response = await fetch(url, {
+          headers: { cookie, "x-amzn-csrf-token": page.csrf, accept: "application/json" },
+          signal: options.signal,
+        });
+        if (!response.ok) return { error: `Quick answered HTTP ${response.status} for its allowance` };
+        const body = await response.json();
+        const hours = Array.isArray(body?.entitlements) ? body.entitlements[0] : undefined;
+        if (!hours) return { error: "Quick returned no agent-hours allowance" };
+        const available = Number(hours.numMinsAvailable) || 0;
+        const provisioned = Number(hours.numMinsProvisioned) || 0;
+        const used = Math.max(0, provisioned - available);
+        const trial = body?.subscriptionMetadata?.freeTrialMetadata;
+        return {
+          plan: typeof body?.subscriptionMetadata?.subscriptionType === "string" ? body.subscriptionMetadata.subscriptionType : "Quick",
+          until: Number(trial?.expiryDate) > 0 ? Number(trial.expiryDate) : undefined,
+          balance: `${(available / 60).toFixed(2)} h left`,
+          windows: [
+            {
+              name: "Agent hours",
+              used: provisioned > 0 ? (used / provisioned) * 100 : null,
+              amount: used / 60,
+              limit: provisioned / 60,
+              unit: "hours",
+            },
+          ],
         };
       },
     },

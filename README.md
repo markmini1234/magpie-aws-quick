@@ -68,6 +68,17 @@ git clone https://github.com/markmini1234/magpie-aws-quick.git
 
 Quick 的 Cookie 过期后，插件返回 401 并标记账号需要重新登录。重新登录一次即可。
 
+## 10 小时用量
+
+Quick 免费试用版给的是 **600 分钟（10 小时）agent hours**。插件会读取 Quick 的 metering 接口，在 Magpie 的账号卡片上显示剩余时长，例如：
+
+```
+9.93 h left
+Agent hours  0.07 / 10 hours
+```
+
+用量用完时 Quick 会拒绝请求；插件把这类“配额/时长”错误转换成 **429**，让 Magpie 把请求交给路由组里的下一个 provider，并让这个账号休息一会儿，而不是当成普通 400。
+
 ## 说明
 
 Quick 没有公开的模型 API，这个插件使用的是 Quick 网页端自己的对话接口，接口和 Cookie 结构可能随 Quick 更新而变化。请只在你自己的账号和使用条款允许范围内使用。
