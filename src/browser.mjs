@@ -9,6 +9,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { applySetCookie } from "./cookies.mjs";
 
 export const QUICK_LOGIN = "https://quick.aws.com/sn/start";
 const WAIT_MS = 5 * 60 * 1000;
@@ -140,16 +141,19 @@ async function stop(proc) {
 
 // signedInAs is the account alias a Quick session belongs to, or "" while the
 // session is still signed out. /sn/start answers a signed-in session with a
-// redirect to /sn/account/<alias>/start; a signed-out one goes to /sn.
+// redirect to /sn/account/<alias>/start; a signed-out one goes to /sn. Quick
+// rotates the session in that reply, so the cookie that comes back is the one
+// the next request must carry.
 async function signedInAs(header, signal) {
   const response = await fetch("https://quick.aws.com/sn/start", {
     headers: { cookie: header, accept: "text/html" },
     redirect: "manual",
     signal,
   });
-  if (response.status !== 302) return "";
+  const cookie = applySetCookie(header, response.headers.getSetCookie?.() ?? []);
+  if (response.status !== 302) return { cookie };
   const found = /\/sn\/account\/([^/?#]+)\//.exec(response.headers.get("location") ?? "");
-  return found ? decodeURIComponent(found[1]) : "";
+  return found ? { alias: decodeURIComponent(found[1]), cookie } : { cookie };
 }
 
 // quickSession waits for a signed-in Quick tab and gives its Cookie header.
@@ -194,8 +198,8 @@ export async function quickSession(signal) {
       // so ask Quick which account the session is for instead.
       if (cookies.has("JSESSIONID")) {
         const header = [...cookies].map(([name, value]) => `${name}=${value}`).join("; ");
-        const alias = await signedInAs(header, signal);
-        if (alias) return { cookies, header, alias };
+        const who = await signedInAs(header, signal);
+        if (who.alias) return { cookies, header: who.cookie, alias: who.alias };
       }
       if (Date.now() > deadline) {
         const seen = [...cookies.keys()];

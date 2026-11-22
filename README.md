@@ -64,6 +64,16 @@ git clone https://github.com/markmini1234/magpie-aws-quick.git
 
 登出/过期时会直接报“会话已过期”，不会再把登录页当成模型回复。
 
+## 会话轮换
+
+Quick 在每次响应里都会下发新的 `JSESSIONID`（`/sn/start`、聊天页、聊天接口都是）。插件会把 `Set-Cookie` 应用到当前 Cookie 上：
+
+- 登录校验后保存的是**轮换后**的会话，不是请求时带去的旧会话
+- 每次聊天页/聊天接口返回的 Cookie 变化都会写回 Magpie 的登录信息
+- 支持多个 `Set-Cookie`、`Max-Age=0` 与 `Expires` 过期删除
+
+不这样做会出现“登录成功、几秒后调用模型却提示会话过期”的现象：服务端已经换掉了旧会话，而插件还存着它。
+
 ## 会话过期
 
 Quick 的 Cookie 过期后，插件返回 401 并标记账号需要重新登录。重新登录一次即可。

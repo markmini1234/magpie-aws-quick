@@ -10,6 +10,7 @@
 // the Quick session itself, not AWS SigV4 credentials.
 import { createHash, randomUUID } from "node:crypto";
 import { QUICK_LOGIN, quickSession } from "./src/browser.mjs";
+import { applySetCookie, headerOf, jarOf } from "./src/cookies.mjs";
 import { decodeEventStream, eventTypeOf, frameMessage } from "./src/eventstream.mjs";
 
 const ID = "quick";
@@ -77,10 +78,12 @@ async function aliasFromServer(cookieHeader, signal) {
     redirect: "manual",
     signal,
   });
+  // Quick hands back the session it will answer the next request with.
+  const cookie = applySetCookie(cookieHeader, response.headers.getSetCookie?.() ?? []);
   if (response.status !== 302) return { error: `Quick answered HTTP ${response.status} instead of redirecting to an account` };
   const location = response.headers.get("location") ?? "";
   const found = /\/sn\/account\/([^/?#]+)\//.exec(location);
-  if (found) return { alias: decodeURIComponent(found[1]) };
+  if (found) return { alias: decodeURIComponent(found[1]), cookie };
   return { expired: true };
 }
 
@@ -92,16 +95,16 @@ async function sessionFrom(cookie, askedAlias, signal) {
       error: `No JSESSIONID in what was pasted (found: ${[...cookie.keys()].join(", ") || "nothing"}). Copy the Cookie header of a request to quick.aws.com while signed in.`,
     };
   }
-  const header = [...cookie].map(([name, value]) => `${name}=${value}`).join("; ");
+  const header = headerOf(cookie);
   const given = typeof askedAlias === "string" ? askedAlias.trim() : "";
   // The server is the word on whether the session is signed in, and which
   // account it belongs to. The cookie alone is not: a signed-out page also
   // carries a JSESSIONID, and the alias cookies appear only after the
   // account page loads.
   const asked = await aliasFromServer(header, signal);
-  if (asked.alias) return { alias: given || asked.alias, cookie: header };
+  if (asked.alias) return { alias: given || asked.alias, cookie: asked.cookie };
   if (asked.expired) return { error: EXPIRED, expired: true };
-  if (given) return { alias: given, cookie: header };
+  if (given) return { alias: given, cookie: asked.cookie };
   return { error: asked.error };
 }
 
@@ -113,6 +116,7 @@ async function pageOf(session, signal) {
     redirect: "manual",
     signal,
   });
+  const cookie = applySetCookie(session.cookie, response.headers.getSetCookie?.() ?? []);
   // A signed-out session is answered with a redirect to /sn, not a page.
   if (response.status !== 200) return { expired: true };
   const page = await response.text();
@@ -121,6 +125,7 @@ async function pageOf(session, signal) {
   const user = USER_ID.exec(page);
   const account = ACCOUNT_ID.exec(page);
   return {
+    cookie,
     csrf: decodeURIComponent(token),
     userId: decodeURIComponent(user?.[1] ?? user?.[2] ?? ""),
     accountId: (account?.[1] ?? account?.[2] ?? "") || session.alias,
@@ -246,6 +251,7 @@ async function quickChat(session, page, body, signal, continued) {
       "content-type": "application/json",
       accept: "*/*",
       "x-amzn-csrf-token": found.csrf,
+      "x-amzn-target": "api",
       origin: ORIGIN,
       referer: `${ORIGIN}/sn/account/${encodeURIComponent(session.alias)}/start/chat`,
     },
@@ -253,7 +259,9 @@ async function quickChat(session, page, body, signal, continued) {
     redirect: "manual",
     signal,
   });
-  return { model, response };
+  // The chat reply rotates the session too; the next turn goes out with it.
+  const cookie = applySetCookie(session.cookie, response.headers.getSetCookie?.() ?? []);
+  return { model, response, cookie };
 }
 
 const errorResponse = (status, message, signIn, headers = {}) =>
@@ -343,7 +351,7 @@ async function answer(response, model, stream, happened = () => {}) {
   });
 }
 
-export async function QuickPlugin(_input, _options = {}) {
+export async function QuickPlugin(input = {}, _options = {}) {
   return {
     async config(cfg) {
       cfg.provider ??= {};
@@ -434,6 +442,22 @@ export async function QuickPlugin(_input, _options = {}) {
         if (typeof cookie !== "string" || !cookie) throw new Error("Quick sign-in has no session cookie");
         if (typeof alias !== "string" || !alias) throw new Error("Quick sign-in has no account alias");
         const session = { cookie, alias };
+        // Quick rotates the session as it answers, so the live cookie is the
+        // one every later request carries, and a change is written back to
+        // Magpie's auth store so a restart keeps the working session.
+        let stored = auth;
+        const keep = async (next) => {
+          if (!next || next === session.cookie) return;
+          session.cookie = next;
+          const set = input?.client?.auth?.set;
+          if (typeof set !== "function") return;
+          const body =
+            stored?.type === "oauth"
+              ? { type: "oauth", access: next, refresh: stored.refresh ?? "", expires: stored.expires ?? 0, ...(stored.metadata ? { metadata: stored.metadata } : {}) }
+              : { type: "api", key: next, ...(stored?.metadata ? { metadata: stored.metadata } : {}) };
+          stored = body;
+          await set({ path: { id: ID }, body });
+        };
         // The page's CSRF token and user ARN are read once and kept for a few
         // minutes. A request that finds the session gone reads it again.
         let page;
@@ -442,6 +466,7 @@ export async function QuickPlugin(_input, _options = {}) {
           if (page && Date.now() - readAt < PAGE_TTL) return page;
           page = await pageOf(session, signal);
           readAt = Date.now();
+          if (page.cookie) await keep(page.cookie);
           return page;
         };
         // Magpie hands the plugin the whole transcript on every request, so a
@@ -489,6 +514,7 @@ export async function QuickPlugin(_input, _options = {}) {
             if (current.expired) return errorResponse(401, EXPIRED, "expired");
             if (current.error) return errorResponse(502, current.error);
             let result = await quickChat(session, current, body, signal, continuing);
+            if (result.cookie) await keep(result.cookie);
             // A CSRF token can be spent by a page the user reloaded; read the
             // page once more and retry that request.
             if (result.response?.status === 401) {
@@ -496,11 +522,13 @@ export async function QuickPlugin(_input, _options = {}) {
               current = await pageNow(signal);
               if (current.expired) return errorResponse(401, EXPIRED, "expired");
               result = await quickChat(session, current, body, signal, continuing);
+              if (result.cookie) await keep(result.cookie);
             } else if (continuing && result.response?.status === 400) {
               // The conversation is gone (deleted, or an older one Quick no
               // longer holds): ask again with the whole transcript.
               continuations.delete(prefixKey);
               result = await quickChat(session, current, body, signal, undefined);
+              if (result.cookie) await keep(result.cookie);
             }
             if (result.expired) return errorResponse(401, EXPIRED, "expired");
             if (result.error) return errorResponse(400, result.error);
@@ -538,9 +566,18 @@ export async function QuickPlugin(_input, _options = {}) {
         url.searchParams.set("userArn", page.userId);
         url.searchParams.set("mbtc", page.csrf);
         const response = await fetch(url, {
-          headers: { cookie, "x-amzn-csrf-token": page.csrf, accept: "application/json" },
+          headers: { cookie: page.cookie ?? cookie, "x-amzn-csrf-token": page.csrf, accept: "application/json" },
           signal: options.signal,
         });
+        // A read rotates the session as any other request does; keep it.
+        const rotated = applySetCookie(page.cookie ?? cookie, response.headers.getSetCookie?.() ?? []);
+        if (rotated !== cookie && input?.client?.auth?.set) {
+          const body =
+            auth?.type === "oauth"
+              ? { type: "oauth", access: rotated, refresh: auth.refresh ?? "", expires: auth.expires ?? 0, ...(auth.metadata ? { metadata: auth.metadata } : {}) }
+              : { type: "api", key: rotated, ...(auth?.metadata ? { metadata: auth.metadata } : {}) };
+          await input.client.auth.set({ path: { id: ID }, body });
+        }
         if (!response.ok) return { error: `Quick answered HTTP ${response.status} for its allowance` };
         const body = await response.json();
         const hours = Array.isArray(body?.entitlements) ? body.entitlements[0] : undefined;
