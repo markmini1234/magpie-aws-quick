@@ -1,8 +1,8 @@
 {
   "name": "magpie-quick-auth",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "AWS Quick chat models inside Magpie, signed from the Quick web session's temporary AWS credentials",
+  "description": "AWS Quick chat models inside Magpie, through the Quick web console's own conversation API",
   "type": "module",
   "main": "./index.mjs",
   "files": [
@@ -19,10 +19,6 @@
     "chat"
   ],
   "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/markmini1234/magpie-aws-quick.git"
-  },
   "engines": {
     "node": ">=20"
   },

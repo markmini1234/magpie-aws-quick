@@ -2,9 +2,9 @@
 //
 // Quick has no public OAuth client for third-party tools, and its login page
 // only returns to quick.aws.com. So the plugin opens a dedicated Chrome
-// profile itself, lets the user sign in there, and reads the cookies through
-// the DevTools protocol. The profile is kept between sign-ins, so a later
-// login usually completes without typing anything.
+// profile itself, lets the user sign in there, and reads the session cookie
+// through the DevTools protocol. The profile is kept between sign-ins, so a
+// later login usually completes without typing anything.
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
@@ -123,8 +123,6 @@ async function cookiesOf(port, signal) {
       urls: [
         "https://quick.aws.com/",
         "https://quick.aws.com/sn",
-        "https://us-east-1.quicksight.aws.amazon.com/",
-        "https://us-east-1.quicksight.aws.amazon.com/sn",
       ],
     });
     return new Map((found.cookies ?? []).map((cookie) => [cookie.name, cookie.value]));
@@ -140,7 +138,7 @@ async function stop(proc) {
   if (proc.exitCode === null) proc.kill("SIGKILL");
 }
 
-// quickSession waits for a signed-in Quick tab and gives its aws-creds.
+// quickSession waits for a signed-in Quick tab and gives its Cookie header.
 export async function quickSession(signal) {
   const binary = browserPath();
   if (!binary) throw new Error("Chrome, Edge, Chromium or Brave is needed for browser sign-in");
@@ -177,16 +175,15 @@ export async function quickSession(signal) {
       } catch {
         // Chrome may still be creating its first page.
       }
-      const raw = cookies.get("aws-creds");
-      if (raw) return { cookies, raw };
+      // The Quick web session is the JSESSIONID pair plus the account alias;
+      // a signed-in tab has both.
+      if (cookies.has("JSESSIONID") && cookies.has("qs-directory-alias")) {
+        const header = [...cookies].map(([name, value]) => `${name}=${value}`).join("; ");
+        return { cookies, header };
+      }
       if (Date.now() > deadline) {
         const seen = [...cookies.keys()];
-        const sso = cookies.has("aws-ds-access-token") || cookies.has("aws-directoryUserInfo");
-        throw new Error(
-          sso
-            ? "Quick signed in through single sign-on, but no aws-creds cookie appeared. Open the Quick console once so quicksight.aws.amazon.com loads, then sign in again."
-            : `Timed out waiting for the Quick sign-in (cookies seen: ${seen.join(", ") || "none"}).`,
-        );
+        throw new Error(`Timed out waiting for the Quick sign-in (cookies seen: ${seen.join(", ") || "none"}).`);
       }
       await sleep(POLL_MS);
     }
