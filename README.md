@@ -64,6 +64,22 @@ git clone https://github.com/markmini1234/magpie-aws-quick.git
 
 登出/过期时会直接报“会话已过期”，不会再把登录页当成模型回复。
 
+## 多账号
+
+插件不再把登录限制成单账号。每登录一次就新增一个 Quick 账号，Magpie 会在这些账号之间分摊请求：
+
+- 某个账号会话过期（401）→ Magpie 标记它并改用下一个
+- 某个账号 10 小时额度用完（插件映射成 429）→ 该账号休息，请求转给下一个
+- 各账号的 Cookie、账号别名、会话续接缓存、用量都是彼此隔离的
+
+添加账号：
+
+```sh
+/Applications/magpie.app/Contents/MacOS/magpie plugin login quick
+```
+
+每执行一次登录一个账号；同一个账号重复登录会替换原来的账号，不会堆出重复项。在 Providers → AWS Quick 里可以看到所有账号，也能设置同时使用几个。
+
 ## 会话轮换
 
 Quick 在每次响应里都会下发新的 `JSESSIONID`（`/sn/start`、聊天页、聊天接口都是）。插件会把 `Set-Cookie` 应用到当前 Cookie 上：

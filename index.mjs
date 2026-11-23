@@ -373,7 +373,10 @@ export async function QuickPlugin(input = {}, _options = {}) {
 
     auth: {
       provider: ID,
-      single: true,
+      // Accounts are kept apart: Magpie spreads requests over every Quick
+      // account signed in, rests one whose session lapsed or whose allowance
+      // ran out, and asks the next. No single: true, and no maxAccounts, so
+      // every account of the user's takes part.
       maxConcurrency: 2,
       methods: [
         {
@@ -401,6 +404,9 @@ export async function QuickPlugin(input = {}, _options = {}) {
                   access: session.cookie,
                   refresh: "",
                   expires: 0,
+                  // Magpie names an account by its id, and two sign-ins of one
+                  // account replace each other rather than piling up.
+                  accountId: session.alias,
                   metadata: { alias: session.alias },
                 };
               },
@@ -429,7 +435,9 @@ export async function QuickPlugin(input = {}, _options = {}) {
             return {
               type: "success",
               key: session.cookie,
-              metadata: { alias: session.alias },
+              // An api sign-in keeps no top-level fields, so the alias rides
+              // in metadata, where Magpie reads an account's name from.
+              metadata: { alias: session.alias, email: session.alias },
             };
           },
         },
