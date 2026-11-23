@@ -459,10 +459,13 @@ export async function QuickPlugin(input = {}, _options = {}) {
           session.cookie = next;
           const set = input?.client?.auth?.set;
           if (typeof set !== "function") return;
+          // An account stored before the alias was a name still gets one, so
+          // the provider list shows which Quick account is which.
+          const metadata = { ...(stored?.metadata ?? {}), alias, email: stored?.metadata?.email ?? alias };
           const body =
             stored?.type === "oauth"
-              ? { type: "oauth", access: next, refresh: stored.refresh ?? "", expires: stored.expires ?? 0, ...(stored.metadata ? { metadata: stored.metadata } : {}) }
-              : { type: "api", key: next, ...(stored?.metadata ? { metadata: stored.metadata } : {}) };
+              ? { type: "oauth", access: next, refresh: stored.refresh ?? "", expires: stored.expires ?? 0, accountId: stored.accountId ?? alias, metadata }
+              : { type: "api", key: next, accountId: stored?.accountId ?? alias, metadata };
           stored = body;
           await set({ path: { id: ID }, body });
         };
