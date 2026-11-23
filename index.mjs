@@ -19,7 +19,7 @@ const CSRF = /&quot;csrf&quot;:&quot;([^&]+)&quot;|"csrf"\s*:\s*"([^"]+)"/;
 const USER_ID = /&quot;quickSightUserId&quot;:&quot;([^&]+)&quot;|"quickSightUserId"\s*:\s*"([^"]+)"/;
 const ACCOUNT_ID = /&quot;awsAccountId&quot;:&quot;([^&]+)&quot;|"awsAccountId"\s*:\s*"([^"]+)"/;
 const QUOTA = /agent\s*hours?|entitlement|quota|usage\s*limit|insufficient.*(minutes|hours)|(minutes|hours).*(exhausted|exceeded)/i;
-const EXPIRED = "The Quick session has expired. Sign in to Quick again and re-add the cookie.";
+const EXPIRED = "The Quick session has expired or was replaced (Quick rotates JSESSIONID on every reply). Sign in to Quick again, or paste a freshly copied cookie.";
 const PAGE_TTL = 5 * 60 * 1000;
 // Quick refuses a userMessage past 50,000 characters
 // (CHAT_MESSAGE_LENGTH_EXCEEDED), so a long conversation is sent as its most
