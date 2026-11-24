@@ -1,3 +1,4 @@
+# 欢迎交流 https://x.com/dahaozi130
 # magpie-quick-auth
 
 把 AWS Quick（`quick.aws.com`）接进 Magpie，provider id 为 `quick`。一个插件，两条通道：
