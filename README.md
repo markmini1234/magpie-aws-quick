@@ -1,147 +1,48 @@
 # magpie-quick-auth
 
-把 AWS Quick（`quick.aws.com`）的聊天模型接进 Magpie，provider id 为 `quick`。
+把 AWS Quick（`quick.aws.com`）接进 Magpie，provider id 为 `quick`。一个插件，两条通道：
 
-## 它走哪条路
+| 通道 | 模型 | 能力 | 登录方式 |
+|---|---|---|---|
+| **桌面 agent 通道**（WS） | `quick/fast` `quick/balanced` `quick/smart` `quick/advanced` | 完整 agent：账号记忆、工具调用、`thinking_effort`，实测 `smart` 服务端给 `us.anthropic.claude-opus-5-5`、1M 上下文 | 浏览器 OIDC（无需桌面端）/ 本地凭据 |
+| **网页轻量通道**（HTTP） | `quick/web-auto` `quick/web-fast` `quick/web-smart` `quick/web-advanced` | 轻量推理：无记忆/工具，更快更省，Cookie 轮换自动保持 | 浏览器抓 Cookie / 粘贴 Cookie |
 
-Quick 网页端不直接调 `quicksight.<region>.amazonaws.com`，而是走自己的代理：
+## 桌面 agent 通道（推荐）
 
-```
-POST https://quick.aws.com/sn/account/<alias>/qbsproxy/quicksight/accounts/<alias>/conversations/chat
-```
+走桌面客户端的 `quickwork-chat-bidirectional-stream` WebSocket，不是网页端那条被限流的 `SpaceNeedleConversationService`。
 
-认证是两样东西：
+**模型**：`agent_mode` 选层，服务端自己路由。实测 `smart` → `us.anthropic.claude-opus-5-5`，`fast` → `us.anthropic.claude-haiku-5-5`。`advanced` 可能归一化到 `smart`。
 
-- 浏览器里 Quick 会话的 **Cookie**（`JSESSIONID` 等）
-- 页面里的 **CSRF 令牌**（`csrf` / `mbtc`）
+**登录**（`magpie login quick`）：
 
-返回的是 AWS event-stream，事件体是 JSON（`textMessageEvent`、`metadataEvent`）。插件把它转换成 OpenAI Chat Completions，所以 Magpie 可以直接用。
+- **账号登录（浏览器 OAuth，无需桌面端）**：重放桌面 App 的 OIDC+PKCE，存 `~/Library/Application Support/magpie-aws-quick/oauth-sessions.json`，`refresh_token` 自动轮换，无需桌面 App。
+- **复制登录地址**：同一流程，给另一台机器的浏览器用（第一次存 discovery，15 分钟内第二次完成）。
+- **本地凭据（桌面端登录态）**：Windows 读 Credential Manager；其他平台拉起 `quickwork-agent --outpost-only` 复用 App 登录态。
 
-**不需要 AWS 的 `aws-creds`，也不需要 IAM / SigV4。** 早期版本试图用 AWS 临时凭证签名，那是错的。
+**能力**：
 
-## 模型
+- 会话续接：增量哈希链 + 模糊锚点 + 网关 session key，跨进程持久化（`thread-sessions.json`，只存哈希不存内容）
+- 工具调用：OpenAI `tools` 经 `<tool_call>` 文本约定桥接，`tool_choice:'required'` 已验证稳定
+- 图片附件：小图内联、大图走 Quick 云附件流
+- `X-Magpie-Effort` → `thinking_effort`（off/low/medium/high/max）
+- 中断、`stop_generation` 尾事件、idle 看门狗、`continuation_expected` 多步轮次都已处理
 
-| Magpie 模型 | Quick 模式 |
-|---|---|
-| `quick/auto` | 不指定，由 Quick 自己选 |
-| `quick/fast` | Fast |
-| `quick/smart` | Smart |
-| `quick/advanced` | Advanced |
+## 网页轻量通道
 
-Quick 只接受 `FAST` / `SMART` / `ADVANCED` 三个值，没有 `BALANCED`。
+走网页端 `POST /conversations/chat`，Cookie + 页面 CSRF。无记忆/工具，但更快，适合简单问答或当 agent 通道不可用时的降级。
 
-## 安装
+**登录**：浏览器抓 Cookie（专用 Chrome 配置窗口）或粘贴 Cookie。Quick 每次响应都轮换 `JSESSIONID`，插件会把 `Set-Cookie` 写回 Magpie 的登录信息，所以不会"登录成功几秒后过期"。
 
-```sh
-/Applications/magpie.app/Contents/MacOS/magpie plugin add /path/to/magpie-quick-auth
-```
-
-或者从 GitHub：
-
-```sh
-git clone https://github.com/markmini1234/magpie-aws-quick.git
-/Applications/magpie.app/Contents/MacOS/magpie plugin add ./magpie-aws-quick
-```
-
-## 登录
-
-### 方式一：浏览器（推荐）
-
-选择 **AWS Quick (browser)**。插件会打开一个专用的 Chrome/Edge 配置窗口，你在里面登录 Quick；登录完成后插件通过 DevTools 读取 Cookie，窗口自动关闭。
-
-专用配置在 `~/.config/magpie/quick-browser/`，下次登录通常会自动恢复会话。
-
-### 方式二：粘贴 Cookie
-
-选择 **AWS Quick cookie**：
-
-1. 登录 `https://quick.aws.com/sn`。
-2. 开发者工具 → Network，点任意一个发往 `quick.aws.com` 的请求。
-3. 复制请求头里的 `Cookie`（或整段 cURL）。
-4. Account alias 留空即可：插件会用这个 Cookie 请求 `/sn/start`，让 Quick 自己告诉它账号。
-
-关键字段是 `JSESSIONID`。`qs-directory-alias`、`qs-saved-accounts` 这些不是必须的——它们只在账号页面加载后才出现，从早期请求复制的 Cookie 往往没有，插件不再依赖它们。
-
-登出/过期时会直接报“会话已过期”，不会再把登录页当成模型回复。
+**上限**：`userMessage` 正好 50,000 字符也会被拒，插件按 49,999 裁剪并尽量续接同一会话。
 
 ## 多账号
 
-插件不再把登录限制成单账号。每登录一次就新增一个 Quick 账号，Magpie 会在这些账号之间分摊请求：
+不限单账号。每登录一次新增一个 Quick 账号，Magpie 在账号间分摊请求：过期（401）或额度用完（429）的账号休息，请求转给下一个。`magpie plugin login quick` 每执行一次登录一个。
 
-- 某个账号会话过期（401）→ Magpie 标记它并改用下一个
-- 某个账号 10 小时额度用完（插件映射成 429）→ 该账号休息，请求转给下一个
-- 各账号的 Cookie、账号别名、会话续接缓存、用量都是彼此隔离的
+## 用量卡片
 
-添加账号：
-
-```sh
-/Applications/magpie.app/Contents/MacOS/magpie plugin login quick
-```
-
-每执行一次登录一个账号；同一个账号重复登录会替换原来的账号，不会堆出重复项。在 Providers → AWS Quick 里可以看到所有账号，也能设置同时使用几个。
-
-## 会话轮换
-
-Quick 在每次响应里都会下发新的 `JSESSIONID`（`/sn/start`、聊天页、聊天接口都是）。插件会把 `Set-Cookie` 应用到当前 Cookie 上：
-
-- 登录校验后保存的是**轮换后**的会话，不是请求时带去的旧会话
-- 每次聊天页/聊天接口返回的 Cookie 变化都会写回 Magpie 的登录信息
-- 支持多个 `Set-Cookie`、`Max-Age=0` 与 `Expires` 过期删除
-
-不这样做会出现“登录成功、几秒后调用模型却提示会话过期”的现象：服务端已经换掉了旧会话，而插件还存着它。
-
-实测对比（同一个账号）：
-
-```
-最初复制的那份 Cookie   /sn/start → 302 账号页（看起来还有效）
-                          /start/chat → 302 登录页（实际已不能聊天）
-插件保存的轮换后 Cookie   /start/chat → 200，聊天 200
-```
-
-所以“旧 Cookie 还能通过 /sn/start”并不代表它还能用。如果粘贴的是一份已经被轮换过的旧 Cookie，会直接报会话过期——重新复制一份最新的，或改用浏览器登录。
-
-## 会话过期
-
-Quick 的 Cookie 过期后，插件返回 401 并标记账号需要重新登录。重新登录一次即可。
-
-## 49999 字符上限
-
-Quick 的 `userMessage` 上限是 **50000 字符**，但实测**正好 50000 字符也会被拒绝**（49999 可以通过），超了会返回：
-
-```
-CHAT_MESSAGE_LENGTH_EXCEEDED: Request exceeded chat message limit of 50000 characters
-```
-
-插件按 **49999 字符**裁剪并发送。它会先尽量**续接同一个 Quick 会话**：Magpie 每次都会把完整对话发过来，插件用“上次发给 Quick 的对话”做前缀匹配，命中就只发这一轮的新消息，历史由 Quick 保存在服务端——和 Quick 网页端的行为一致，长对话因此不再撞上限。
-
-只有开新会话（首轮、改了系统提示、重新生成）时才会整段发送，这时才按预算裁剪：系统提示优先保留，最新一轮完整保留，旧消息从最早的一条开始丢弃，并在开头标注 `[... earlier messages omitted ...]`。单条超长消息会保留首尾并标注 `[... truncated ...]`。
-
-如果续接会话里这一轮的新消息本身就超过 49999 字符（例如粘贴了大文件，或客户端把巨大的工具结果塞进了 user 消息），插件不会把截断后的半句话追加到旧会话，而是改为携带裁剪后的完整对话开新会话。
-
-重新生成（对话内容没变再发一次）会开一个新 Quick 会话，避免同一条消息在旧会话里重复追加。
-
-## 和网页版的差别
-
-插件用的是网页端的 HTTP 对话接口 `/conversations/chat`，它是一条**轻量推理通道**。Quick 网页端真正聊天时走的是 `ChatBidirectionalStream` WebSocket，带的是完整 agent：账号记忆、工具调用、`agent_mode` / `thinking_effort` / `web_search_enabled` 等参数。
-
-实测同一句话：
-
-- HTTP 通道：自称 “Quick / Amazon Quick 的 AI 助手”，不知道账号里的时区记忆，也不会调用 `get_current_time`
-- 网页端 WebSocket：自称 “AWS Quick”，会读记忆、调用工具，`turn_usage` 里的模型是 `us.anthropic.claude-opus-5-5`，上下文 1,000,000
-
-所以“感觉降智”不是 49999 字符裁剪造成的，而是这条 HTTP 通道本身少了网页端 agent 的记忆和工具层。网页搜索在 HTTP 通道仍然可用（模型判断需要时会触发 `EXTERNAL_SEARCH`）。要完全对齐网页端，需要把插件改成走 WebSocket，这是一次较大的传输层改造。
-
-## 10 小时用量
-
-Quick 免费试用版给的是 **600 分钟（10 小时）agent hours**。插件会读取 Quick 的 metering 接口，在 Magpie 的账号卡片上显示剩余时长，例如：
-
-```
-9.93 h left
-Agent hours  0.07 / 10 hours
-```
-
-用量用完时 Quick 会拒绝请求；插件把这类“配额/时长”错误转换成 **429**，让 Magpie 把请求交给路由组里的下一个 provider，并让这个账号休息一会儿，而不是当成普通 400。
+账号卡片显示 `Quick Lite (free trial)` 等计划和 agent hours 用量，到期时间，按账号隔离。
 
 ## 说明
 
-Quick 没有公开的模型 API，这个插件使用的是 Quick 网页端自己的对话接口，接口和 Cookie 结构可能随 Quick 更新而变化。请只在你自己的账号和使用条款允许范围内使用。
+桌面 agent 通道基于 [magpie-aws-quick](https://github.com/httpdone/magpie-aws-quick)（httpdone）的协议实现（MIT），整合了本插件原有的网页通道、多账号路由和 Cookie 轮换。Quick 无公开 API，两条通道都驱动其内部协议，接口可能随 Quick 更新变化。请只在你自己的账号和使用条款允许范围内使用。

@@ -1,6 +1,6 @@
 {
   "name": "magpie-quick-auth",
-  "version": "0.2.9",
+  "version": "0.3.0",
   "private": true,
   "description": "AWS Quick chat models inside Magpie, through the Quick web console's own conversation API",
   "type": "module",
@@ -8,7 +8,10 @@
   "files": [
     "index.mjs",
     "src/",
-    "README.md"
+    "lib/",
+    "README.md",
+    "LICENSE",
+    "PROTOCOL.md"
   ],
   "keywords": [
     "opencode",
@@ -25,5 +28,8 @@
   "magpie": {
     "maxConcurrency": 2,
     "icon": "data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220%200%2020%2020%22%3E%3Cdefs%3E%3ClinearGradient%20id=%22g%22%20x1=%2217.14%22%20y1=%22-1.56%22%20x2=%221.06%22%20y2=%2220.04%22%20gradientUnits=%22userSpaceOnUse%22%3E%3Cstop%20stop-color=%22%23FF4B14%22/%3E%3Cstop%20offset=%22.33%22%20stop-color=%22%23D600BA%22/%3E%3Cstop%20offset=%22.67%22%20stop-color=%22%2378008A%22/%3E%3Cstop%20offset=%221%22%20stop-color=%22%236842FF%22/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath%20fill=%22url(%23g)%22%20d=%22M17.82%204.14l-6.65-3.83a1.43%201.43%200%2000-1.43%200L3.1%204.14A1.4%201.4%200%20002.4%205.3v7.66c0%20.83.45%201.61%201.17%202.03l6.65%203.82a1.43%201.43%200%20002.36-1.17V6.17c0-.28-.15-.54-.39-.68a.78.78%200%2000-.78%200L5.9%209.22v2.94l4.06-2.35v5.55l1.5.87V5.7l5.96-3.43v8.3l-5.96%203.43v1.56l6.65-3.82c.73-.42%201.17-1.2%201.17-2.03V6.17c0-.83-.45-1.61-1.18-2.03z%22/%3E%3C/svg%3E"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
   }
 }
