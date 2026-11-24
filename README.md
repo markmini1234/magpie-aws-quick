@@ -104,19 +104,32 @@ Quick 在每次响应里都会下发新的 `JSESSIONID`（`/sn/start`、聊天�
 
 Quick 的 Cookie 过期后，插件返回 401 并标记账号需要重新登录。重新登录一次即可。
 
-## 50000 字符上限
+## 49999 字符上限
 
-Quick 的 `userMessage` 上限是 **50000 字符**，超了会返回：
+Quick 的 `userMessage` 上限是 **50000 字符**，但实测**正好 50000 字符也会被拒绝**（49999 可以通过），超了会返回：
 
 ```
 CHAT_MESSAGE_LENGTH_EXCEEDED: Request exceeded chat message limit of 50000 characters
 ```
 
-插件会先尽量**续接同一个 Quick 会话**：Magpie 每次都会把完整对话发过来，插件用“上次发给 Quick 的对话”做前缀匹配，命中就只发这一轮的新消息，历史由 Quick 保存在服务端——和 Quick 网页端的行为一致，长对话因此不再撞 5 万字符上限。
+插件按 **49999 字符**裁剪并发送。它会先尽量**续接同一个 Quick 会话**：Magpie 每次都会把完整对话发过来，插件用“上次发给 Quick 的对话”做前缀匹配，命中就只发这一轮的新消息，历史由 Quick 保存在服务端——和 Quick 网页端的行为一致，长对话因此不再撞上限。
 
 只有开新会话（首轮、改了系统提示、重新生成）时才会整段发送，这时才按预算裁剪：系统提示优先保留，最新一轮完整保留，旧消息从最早的一条开始丢弃，并在开头标注 `[... earlier messages omitted ...]`。单条超长消息会保留首尾并标注 `[... truncated ...]`。
 
+如果续接会话里这一轮的新消息本身就超过 49999 字符（例如粘贴了大文件，或客户端把巨大的工具结果塞进了 user 消息），插件不会把截断后的半句话追加到旧会话，而是改为携带裁剪后的完整对话开新会话。
+
 重新生成（对话内容没变再发一次）会开一个新 Quick 会话，避免同一条消息在旧会话里重复追加。
+
+## 和网页版的差别
+
+插件用的是网页端的 HTTP 对话接口 `/conversations/chat`，它是一条**轻量推理通道**。Quick 网页端真正聊天时走的是 `ChatBidirectionalStream` WebSocket，带的是完整 agent：账号记忆、工具调用、`agent_mode` / `thinking_effort` / `web_search_enabled` 等参数。
+
+实测同一句话：
+
+- HTTP 通道：自称 “Quick / Amazon Quick 的 AI 助手”，不知道账号里的时区记忆，也不会调用 `get_current_time`
+- 网页端 WebSocket：自称 “AWS Quick”，会读记忆、调用工具，`turn_usage` 里的模型是 `us.anthropic.claude-opus-5-5`，上下文 1,000,000
+
+所以“感觉降智”不是 49999 字符裁剪造成的，而是这条 HTTP 通道本身少了网页端 agent 的记忆和工具层。网页搜索在 HTTP 通道仍然可用（模型判断需要时会触发 `EXTERNAL_SEARCH`）。要完全对齐网页端，需要把插件改成走 WebSocket，这是一次较大的传输层改造。
 
 ## 10 小时用量
 

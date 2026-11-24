@@ -21,10 +21,10 @@ const ACCOUNT_ID = /&quot;awsAccountId&quot;:&quot;([^&]+)&quot;|"awsAccountId"\
 const QUOTA = /agent\s*hours?|entitlement|quota|usage\s*limit|insufficient.*(minutes|hours)|(minutes|hours).*(exhausted|exceeded)/i;
 const EXPIRED = "The Quick session has expired or was replaced (Quick rotates JSESSIONID on every reply). Sign in to Quick again, or paste a freshly copied cookie.";
 const PAGE_TTL = 5 * 60 * 1000;
-// Quick refuses a userMessage past 50,000 characters
-// (CHAT_MESSAGE_LENGTH_EXCEEDED), so a long conversation is sent as its most
-// recent turns rather than whole.
-const MESSAGE_LIMIT = 50_000;
+// Quick refuses a userMessage of exactly 50,000 characters
+// (CHAT_MESSAGE_LENGTH_EXCEEDED; 49,999 is accepted), so a long conversation
+// is sent as its most recent turns rather than whole.
+const MESSAGE_LIMIT = 49_999;
 const OMITTED = "[... earlier messages omitted ...]";
 const CUT = "\n[... truncated ...]";
 
@@ -228,7 +228,13 @@ async function quickChat(session, page, body, signal, continued) {
   const model = String(body.model ?? "auto").replace(`${ID}/`, "");
   const mode = MODES[model]?.mode;
   const turns = Array.isArray(body.messages) ? body.messages : [];
-  const userMessage = continued ? textOf(turns.at(-1)?.content) : promptOf(turns);
+  const latest = continued ? textOf(turns.at(-1)?.content) : "";
+  // A single turn can be longer than Quick accepts (a large pasted file, or a
+  // tool result the client folded into a user message). Continuing would send
+  // that one turn whole and draw CHAT_MESSAGE_LENGTH_EXCEEDED, so start from
+  // the clipped transcript instead.
+  const continues = continued && latest.length <= MESSAGE_LIMIT ? continued : undefined;
+  const userMessage = continues ? latest : promptOf(turns);
   if (!userMessage) return { error: "Quick needs at least one non-empty text message" };
 
   const found = page;
@@ -240,8 +246,8 @@ async function quickChat(session, page, body, signal, continued) {
     userMessage,
     clientToken: randomUUID(),
     inferenceOnly: true,
-    temporaryChat: !continued,
-    ...(continued ? { conversationId: continued } : {}),
+    temporaryChat: !continues,
+    ...(continues ? { conversationId: continues } : {}),
     ...(mode ? { performanceMode: mode } : {}),
   };
   const response = await fetch(url, {
